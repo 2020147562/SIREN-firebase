@@ -1,79 +1,151 @@
-/**
- * Import function triggers from their respective submodules:
- *
- * const {onCall} = require("firebase-functions/v2/https");
- * const {onDocumentWritten} = require("firebase-functions/v2/firestore");
- *
- * See a full list of supported triggers at https://firebase.google.com/docs/functions
- */
-
-const {onRequest} = require("firebase-functions/v2/https");
-const multer = require("multer");
-const axios = require("axios");
+const functions = require("firebase-functions");
+const admin = require("firebase-admin");
 const express = require("express");
-const cors = require("cors");
-const FormData = require("form-data"); // axios와 함께 사용
+const multer = require("multer");
+const FormData = require("form-data");
+const axios = require("axios");
+const nodemailer = require("nodemailer");
+const fs = require("fs");
+const path = require("path");
 
+admin.initializeApp();
 const app = express();
 
-// CORS 설정
-app.use(cors({origin: true}));
+// 멀터로 파일 업로드 처리
+const upload = multer({ storage: multer.memoryStorage() });
 
-// multer: multipart/form-data 처리 미들웨어, 메모리에 파일 저장
-const upload = multer({storage: multer.memoryStorage()});
+const gmailUser = "siren0682@gmail.com";
+const gmailPass = "solchalsiren2568";
 
-// POST 요청을 처리, wav와 txt 파일 필드 허용
-app.post("/", upload.fields(
-    [{name: "audio_file"}, {name: "text_file"}]), async (req, res) => {
+// 이메일 전송 함수 (파일 첨부 포함)
+async function sendEmailToPolice(score, wavBuffer, wavName, txtBuffer, txtName) {
+  const wavPath = path.join("/tmp", wavName);
+  const txtPath = path.join("/tmp", txtName);
+  fs.writeFileSync(wavPath, wavBuffer);
+  fs.writeFileSync(txtPath, txtBuffer);
+
+  const transporter = nodemailer.createTransport({
+    service: "gmail",
+    auth: {
+      user: gmailUser,
+      pass: gmailPass
+    }
+  });
+
+  await transporter.sendMail({
+    from: gmailUser,
+    to: "cp_zero@yonsei.ac.kr",
+    subject: "위험 상황 신고",
+    text: `위험도 점수: ${score}`,
+    attachments: [
+      { filename: wavName, path: wavPath },
+      { filename: txtName, path: txtPath }
+    ]
+  });
+
+  console.log("이메일 전송 완료");
+}
+
+// FCM 푸쉬 전송 함수 (친구만 대상으로)
+async function sendPushNotificationToFriends(score, dangerUserId) {
+  const db = admin.database();
+
+  // username 가져오기 (dangerUserId → username)
+  const usernameSnap = await db.ref(`username/${dangerUserId}`).once("value");
+  const username = usernameSnap.val();
+
+  if (!username) {
+    console.log("username을 찾을 수 없습니다.");
+    return;
+  }
+
+  // 친구 목록 가져오기 (배열 형태)
+  const friendsSnap = await db.ref(`friends/${dangerUserId}`).once("value");
+  const friendsList = friendsSnap.val();
+
+  if (!friendsList || !Array.isArray(friendsList)) {
+    console.log("친구 목록이 비어있거나 올바르지 않음");
+    return;
+  }
+
+  // 친구들의 fcm 토큰 가져오기
+  const tokens = [];
+
+  const tokenFetchPromises = friendsList.map(async (friendId) => {
+    const tokenSnap = await db.ref(`fcm_tokens/${friendId}`).once("value");
+    const token = tokenSnap.val();
+    if (token) {
+      tokens.push(token);
+    }
+  });
+
+  await Promise.all(tokenFetchPromises);
+
+  if (tokens.length === 0) {
+    console.log("푸쉬 보낼 등록된 친구가 없거나 상응하는 토큰이 검색되지 않음.");
+    return;
+  }
+
+  // 푸쉬 메시지 구성
+  const payload = {
+    notification: {
+      title: "위험 상황 발생",
+      body: `${username}님에게 위험도 ${score}인 상황이 감지되었습니다.`,
+    },
+    tokens: tokens,
+  };
+
+  const response = await admin.messaging().sendMulticast(payload);
+  console.log("푸쉬알림 전송 완료:", response.successCount);
+}
+
+// POST 요청 핸들링
+app.post("/", upload.fields([
+  { name: "audio_file" }, 
+  { name: "text_file" }, 
+]), async (req, res) => {
   try {
-    // 프론트에서 업로드한 파일 추출
-    const wavFile = req.files["audio_file"][0];
-    const txtFile = req.files["text_file"][0];
+    const userId = req.body.userId;
+    if (!userId) {
+      return res.status(400).send({ error: "no userId sent from frontend" });
+    }
 
-    // axios에서 multipart/form-data 전송 위해 FormData 구성
+    const wavFile = req.files["audio_file"]?.[0];
+    const txtFile = req.files["text_file"]?.[0];
+    if (!txtFile) {
+      return res.status(400).send({ error: "no text file sent from frontend" });
+    }
+
+    // FastAPI로 전송
     const formData = new FormData();
-    formData.append("audio_file", wavFile.buffer,
-        {filename: wavFile.originalname});
-    formData.append("text_file", txtFile.buffer,
-        {filename: txtFile.originalname});
+    formData.append("audio_file", wavFile.buffer, wavFile.originalname);
+    formData.append("text_file", txtFile.buffer, txtFile.originalname);
 
-    // FastAPI 서버로 relay
     const response = await axios.post("http://3.36.56.9:8000/analyze", formData, {
       headers: formData.getHeaders(),
     });
 
     const dangerScore = response.data.danger_score;
+    console.log("dangerScore:", dangerScore);
 
-    if (dangerScore > 90) {
-      res.status(200).send({
-        danger_score: dangerScore,
-        result: "경찰에 신고 필요",
-      });
-    } else if (dangerScore > 75) {
-      res.status(200).send({
-        danger_score: dangerScore,
-        result: "지인에게 신고 필요",
-      });
-    } else {
-      res.status(200).send({
-        danger_score: dangerScore,
-        result: "안전",
-      });
+    if (dangerScore >= 90) {
+      await sendEmailToPolice(
+        dangerScore,
+        wavFile.buffer, wavFile.originalname,
+        txtFile.buffer, txtFile.originalname
+      );
     }
+
+    if (dangerScore >= 75) {
+      await sendPushNotificationToFriends(dangerScore, userId);
+    }
+
+    res.status(200).send({ "dangerScore": dangerScore });
   } catch (err) {
-    console.error("Error relaying request:", err.message);
-    res.status(500).send({error: "파일 처리 실패"});
+    console.error("error:", err.message);
+    res.status(500).send({ error: "서버 오류" });
   }
 });
 
-// Firebase Function으로 내보냄
-exports.proxyUpload = onRequest({region: "asia-northeast3"}, app);
-
-
-// Create and deploy your first functions
-// https://firebase.google.com/docs/functions/get-started
-
-// exports.helloWorld = onRequest((request, response) => {
-//   logger.info("Hello logs!", {structuredData: true});
-//   response.send("Hello from Firebase!");
-// });
+// Firebase Function 등록
+exports.handleDangerRequest = functions.https.onRequest(app);
