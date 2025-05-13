@@ -1,24 +1,133 @@
 const functions = require("firebase-functions");
 const admin = require("firebase-admin");
 const express = require("express");
-const multer = require("multer");
 const FormData = require("form-data");
 const axios = require("axios");
 const nodemailer = require("nodemailer");
 const fs = require("fs");
 const path = require("path");
+const ffmpeg = require("fluent-ffmpeg");
+const { SpeechClient } = require("@google-cloud/speech");
+const { file: tmpFile } = require("tmp-promise");
+const { exec } = require("child_process");
+const { onRequest } = require("firebase-functions/v2/https");
 
 admin.initializeApp();
 const app = express();
+const speechClient = new SpeechClient();
 
-// 멀터로 파일 업로드 처리
-const upload = multer({ storage: multer.memoryStorage() });
+// JSON body parsing
+app.use(express.json());
 
-const gmailUser = "siren0682@gmail.com";
-const gmailPass = "solchalsiren2568";
+// Gmail credentials from env
+const gmailUser = process.env.GMAIL_USER;
+const gmailPass = process.env.GMAIL_PASS;
 
-// 이메일 전송 함수 (파일 첨부 포함)
-async function sendEmailToPolice(score, wavBuffer, wavName, txtBuffer, txtName) {
+async function convertAacToWav(aacBuffer) {
+  const input = await tmpFile({ postfix: ".aac" });
+  const output = await tmpFile({ postfix: ".wav" });
+  fs.writeFileSync(input.path, aacBuffer);
+
+  functions.logger.info("🎵 Starting FFmpeg conversion", { input: input.path });
+
+  await new Promise((resolve, reject) => {
+    ffmpeg(input.path)
+      .toFormat("wav")
+      .on("error", err => reject(err))
+      .on("end", () => resolve())
+      .save(output.path);
+  });
+
+  return output;
+}
+
+async function getSampleRate(wavPath) {
+  return new Promise((resolve, reject) => {
+    exec(
+      `ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 ${wavPath}`,
+      (err, stdout) => {
+        if (err) return reject(err);
+        resolve(parseInt(stdout.trim(), 10));
+      }
+    );
+  });
+}
+
+async function generateTranscript(wavPath) {
+  const sampleRate = await getSampleRate(wavPath);
+  const audioBytes = fs.readFileSync(wavPath).toString("base64");
+  const [response] = await speechClient.recognize({
+    audio: { content: audioBytes },
+    config: {
+      encoding: "LINEAR16",
+      sampleRateHertz: sampleRate,
+      languageCode: "en-US",
+    },
+  });
+
+  const transcript = response.results
+    .map(r => r.alternatives[0].transcript)
+    .join("\n");
+  const txt = await tmpFile({ postfix: ".txt" });
+  fs.writeFileSync(txt.path, transcript || "[Empty Transcript]");
+  return txt;
+}
+
+app.get("/", (req, res) => res.send("Default GET"));
+
+app.post("/", async (req, res) => {
+  try {
+    functions.logger.info("📩 Received POST request");
+
+    const { userId, storageUrl } = req.body;
+    if (!userId) return res.status(400).send({ error: "Missing userId" });
+    if (!storageUrl) return res.status(400).send({ error: "Missing storageUrl" });
+
+    // Parse gs:// URL
+    let bucketName, filePath;
+    const gsMatch = storageUrl.match(/^gs:\/\/(.+?)\/(.+)$/);
+    if (gsMatch) {
+      bucketName = gsMatch[1];
+      filePath = gsMatch[2];
+    } else {
+      return res.status(400).send({ error: "Invalid storageUrl format" });
+    }
+
+    // Download .aac to tmp
+    const aacTmp = await tmpFile({ postfix: ".aac" });
+    await admin.storage().bucket(bucketName).file(filePath).download({ destination: aacTmp.path });
+    const aacBuffer = fs.readFileSync(aacTmp.path);
+
+    // Convert and transcribe
+    const wav = await convertAacToWav(aacBuffer);
+    const txt = await generateTranscript(wav.path);
+
+    // Forward to analysis API
+    const formData = new FormData();
+    formData.append("audio_file", fs.createReadStream(wav.path), { filename: "audio_file.wav" });
+    formData.append("text_file", fs.createReadStream(txt.path), { filename: "text_file.txt" });
+    const resp = await axios.post("http://3.36.56.9:8000/analyze", formData, { headers: formData.getHeaders() });
+    const dangerScore = resp.data.danger_score;
+
+    // Actions based on score
+    if (dangerScore >= 90) {
+      await sendEmail(dangerScore, fs.readFileSync(wav.path), "audio.wav", fs.readFileSync(txt.path), "text.txt", "cp_zero@yonsei.ac.kr");
+    }
+    if (dangerScore >= 75) {
+      const db = admin.database();
+      const emailSnap = await db.ref(`userEmail/${userId}`).once("value");
+      await sendPushNotificationToFriends(dangerScore, userId);
+      await sendEmail(dangerScore, fs.readFileSync(wav.path), "audio.wav", fs.readFileSync(txt.path), "text.txt", emailSnap.val());
+    }
+
+    res.status(200).send({ dangerScore });
+  } catch (err) {
+    functions.logger.error("🔥 Error during processing", err);
+    res.status(500).send({ error: err.message });
+  }
+});
+
+async function sendEmail(score, wavBuffer, wavName, txtBuffer, txtName, recipient) {
   const wavPath = path.join("/tmp", wavName);
   const txtPath = path.join("/tmp", txtName);
   fs.writeFileSync(wavPath, wavBuffer);
@@ -26,126 +135,36 @@ async function sendEmailToPolice(score, wavBuffer, wavName, txtBuffer, txtName) 
 
   const transporter = nodemailer.createTransport({
     service: "gmail",
-    auth: {
-      user: gmailUser,
-      pass: gmailPass
-    }
+    auth: { user: gmailUser, pass: gmailPass },
   });
-
   await transporter.sendMail({
     from: gmailUser,
-    to: "cp_zero@yonsei.ac.kr",
-    subject: "위험 상황 신고",
-    text: `위험도 점수: ${score}`,
+    to: recipient,
+    subject: "Emergency Alert",
+    text: `Detected danger score: ${score}`,
     attachments: [
       { filename: wavName, path: wavPath },
-      { filename: txtName, path: txtPath }
-    ]
+      { filename: txtName, path: txtPath },
+    ],
   });
-
-  console.log("이메일 전송 완료");
 }
 
-// FCM 푸쉬 전송 함수 (친구만 대상으로)
 async function sendPushNotificationToFriends(score, dangerUserId) {
   const db = admin.database();
-
-  // username 가져오기 (dangerUserId → username)
-  const usernameSnap = await db.ref(`username/${dangerUserId}`).once("value");
-  const username = usernameSnap.val();
-
-  if (!username) {
-    console.log("username을 찾을 수 없습니다.");
-    return;
-  }
-
-  // 친구 목록 가져오기 (배열 형태)
+  const userSnap = await db.ref(`username/${dangerUserId}`).once("value");
   const friendsSnap = await db.ref(`friends/${dangerUserId}`).once("value");
-  const friendsList = friendsSnap.val();
-
-  if (!friendsList || !Array.isArray(friendsList)) {
-    console.log("친구 목록이 비어있거나 올바르지 않음");
-    return;
-  }
-
-  // 친구들의 fcm 토큰 가져오기
   const tokens = [];
-
-  const tokenFetchPromises = friendsList.map(async (friendId) => {
-    const tokenSnap = await db.ref(`fcm_tokens/${friendId}`).once("value");
-    const token = tokenSnap.val();
-    if (token) {
-      tokens.push(token);
-    }
+  Object.values(friendsSnap.val() || {}).forEach(async id => {
+    const t = (await db.ref(`fcmToken/${id}`).once("value")).val();
+    if (t) tokens.push(t);
   });
-
-  await Promise.all(tokenFetchPromises);
-
-  if (tokens.length === 0) {
-    console.log("푸쉬 보낼 등록된 친구가 없거나 상응하는 토큰이 검색되지 않음.");
-    return;
-  }
-
-  // 푸쉬 메시지 구성
-  const payload = {
-    notification: {
-      title: "위험 상황 발생",
-      body: `${username}님에게 위험도 ${score}인 상황이 감지되었습니다.`,
-    },
-    tokens: tokens,
-  };
-
-  const response = await admin.messaging().sendMulticast(payload);
-  console.log("푸쉬알림 전송 완료:", response.successCount);
+  if (!tokens.length) return;
+  await admin.messaging().sendMulticast({ notification: { title: "Emergency Detected", body: `${userSnap.val()} triggered ${score}` }, tokens });
 }
 
-// POST 요청 핸들링
-app.post("/", upload.fields([
-  { name: "audio_file" }, 
-  { name: "text_file" }, 
-]), async (req, res) => {
-  try {
-    const userId = req.body.userId;
-    if (!userId) {
-      return res.status(400).send({ error: "no userId sent from frontend" });
-    }
-
-    const wavFile = req.files["audio_file"]?.[0];
-    const txtFile = req.files["text_file"]?.[0];
-    if (!txtFile) {
-      return res.status(400).send({ error: "no text file sent from frontend" });
-    }
-
-    // FastAPI로 전송
-    const formData = new FormData();
-    formData.append("audio_file", wavFile.buffer, wavFile.originalname);
-    formData.append("text_file", txtFile.buffer, txtFile.originalname);
-
-    const response = await axios.post("http://3.36.56.9:8000/analyze", formData, {
-      headers: formData.getHeaders(),
-    });
-
-    const dangerScore = response.data.danger_score;
-    console.log("dangerScore:", dangerScore);
-
-    if (dangerScore >= 90) {
-      await sendEmailToPolice(
-        dangerScore,
-        wavFile.buffer, wavFile.originalname,
-        txtFile.buffer, txtFile.originalname
-      );
-    }
-
-    if (dangerScore >= 75) {
-      await sendPushNotificationToFriends(dangerScore, userId);
-    }
-
-    res.status(200).send({ "dangerScore": dangerScore });
-  } catch (err) {
-    console.error("error:", err.message);
-    res.status(500).send({ error: "서버 오류" });
-  }
+app.use((err, req, res, next) => {
+  functions.logger.error("🔥 Global error handler", err);
+  res.status(500).send({ error: err.message });
 });
 
-// Firebase Function 등록
-exports.handleDangerRequest = functions.https.onRequest(app);
+exports.handleDangerRequest = onRequest({ region: "asia-northeast3", timeoutSeconds: 60 }, app);
