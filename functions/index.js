@@ -1,4 +1,5 @@
 const functions = require("firebase-functions");
+const { defineSecret } = require("firebase-functions/params");
 const admin = require("firebase-admin");
 const express = require("express");
 const FormData = require("form-data");
@@ -11,6 +12,7 @@ const { SpeechClient } = require("@google-cloud/speech");
 const { file: tmpFile } = require("tmp-promise");
 const { exec } = require("child_process");
 const { onRequest } = require("firebase-functions/v2/https");
+const { getMessaging } = require("firebase-admin/messaging");
 
 admin.initializeApp();
 const app = express();
@@ -20,8 +22,8 @@ const speechClient = new SpeechClient();
 app.use(express.json());
 
 // Gmail credentials from env
-const gmailUser = process.env.GMAIL_USER;
-const gmailPass = process.env.GMAIL_PASS;
+const gmailUser = defineSecret("GMAIL_USER");
+const gmailPass = defineSecret("GMAIL_PASS");
 
 async function convertAacToWav(aacBuffer) {
   const input = await tmpFile({ postfix: ".aac" });
@@ -79,9 +81,11 @@ app.post("/", async (req, res) => {
   try {
     functions.logger.info("📩 Received POST request");
 
-    const { userId, storageUrl } = req.body;
+    const { userId, storageUrl, latitude, longitude } = req.body;
     if (!userId) return res.status(400).send({ error: "Missing userId" });
     if (!storageUrl) return res.status(400).send({ error: "Missing storageUrl" });
+    if (!latitude) return res.status(400).send({ error: "Missing latitude" });
+    if (!longitude) return res.status(400).send({ error: "Missing longitude" });
 
     // Parse gs:// URL
     let bucketName, filePath;
@@ -114,10 +118,36 @@ app.post("/", async (req, res) => {
       await sendEmail(dangerScore, fs.readFileSync(wav.path), "audio.wav", fs.readFileSync(txt.path), "text.txt", "cp_zero@yonsei.ac.kr");
     }
     if (dangerScore >= 75) {
-      const db = admin.database();
-      const emailSnap = await db.ref(`userEmail/${userId}`).once("value");
-      await sendPushNotificationToFriends(dangerScore, userId);
-      await sendEmail(dangerScore, fs.readFileSync(wav.path), "audio.wav", fs.readFileSync(txt.path), "text.txt", emailSnap.val());
+        const db = admin.database();
+        await sendPushNotificationToFriends(dangerScore, userId);
+        // 1) 친구 목록 가져오기
+        const friendsSnap = await db.ref(`friends/${userId}`).once("value");
+        const friendsObj  = friendsSnap.val() || {};
+        const friendIds   = Object.values(friendsObj); // 친구들의 userId 리스트
+
+        // 2) 친구들한테 푸시 알림
+        await sendPushNotificationToFriends(dangerScore, userId);
+
+        // 3) 친구들 모두에게 이메일 전송
+        for (const friendId of friendIds) {
+            const emailSnap = await db.ref(`userEmail/${friendId}`).once("value");
+            const friendEmail = emailSnap.val();
+            if (friendEmail) {
+            await sendEmail(
+                dangerScore,
+                fs.readFileSync(wav.path),
+                "audio.wav",
+                fs.readFileSync(txt.path),
+                "text.txt",
+                friendEmail,
+                latitude,
+                longitude
+            );
+            functions.logger.info("📧 Email sent to friend", { friendId, friendEmail });
+            } else {
+            functions.logger.warn("⚠️ Friend email not found, skipping", { friendId });
+            }
+        }
     }
 
     res.status(200).send({ dangerScore });
@@ -127,39 +157,92 @@ app.post("/", async (req, res) => {
   }
 });
 
-async function sendEmail(score, wavBuffer, wavName, txtBuffer, txtName, recipient) {
-  const wavPath = path.join("/tmp", wavName);
-  const txtPath = path.join("/tmp", txtName);
-  fs.writeFileSync(wavPath, wavBuffer);
-  fs.writeFileSync(txtPath, txtBuffer);
+async function sendEmail(score, wavBuffer, wavName, txtBuffer, txtName, recipient, latitude, longitude) {
+    // SecretParam에서 실제 문자열을 가져옵니다.
+    const user = await gmailUser.value();
+    const pass = await gmailPass.value();
+  
+    const wavPath = path.join("/tmp", wavName);
+    const txtPath = path.join("/tmp", txtName);
+    fs.writeFileSync(wavPath, wavBuffer);
+    fs.writeFileSync(txtPath, txtBuffer);
+  
+    functions.logger.info("📧 Preparing to send email", { to: recipient, wavPath, txtPath, score });
+  
+    // user, pass에 실제 문자열을 전달해야 합니다.
+    const transporter = nodemailer.createTransport({
+      service: "gmail",
+      auth: { user, pass },
+    });
+  
+    try {
+      const info = await transporter.sendMail({
+        from: user,
+        to: recipient,
+        subject: "SIREN: Emergency Alert",
+        text: `Dear user,
 
-  const transporter = nodemailer.createTransport({
-    service: "gmail",
-    auth: { user: gmailUser, pass: gmailPass },
-  });
-  await transporter.sendMail({
-    from: gmailUser,
-    to: recipient,
-    subject: "Emergency Alert",
-    text: `Detected danger score: ${score}`,
-    attachments: [
-      { filename: wavName, path: wavPath },
-      { filename: txtName, path: txtPath },
-    ],
-  });
+        An emergency situation has been detected based on the analysis of recent voice and speech input.
+
+        Danger Score: ${score}
+        Location of the incident: https://www.google.com/maps?q=${latitude},${longitude}
+
+        This score indicates a potentially critical or harmful interaction. For your review and further action, we have attached:
+        - The original audio recording (.wav)
+        - The transcribed speech content (.txt)
+
+        Please assess the situation and take appropriate measures if necessary.
+
+        Sincerely,
+        SIREN Automated Alert System`,
+        attachments: [
+          { filename: wavName, path: wavPath },
+          { filename: txtName, path: txtPath },
+        ],
+      });
+      functions.logger.info("✅ Email sent successfully", { messageId: info.messageId, to: recipient });
+    } catch (err) {
+      functions.logger.error("❌ Failed to send email", { to: recipient, error: err.message });
+      throw err;
+    }
 }
-
+  
 async function sendPushNotificationToFriends(score, dangerUserId) {
-  const db = admin.database();
-  const userSnap = await db.ref(`username/${dangerUserId}`).once("value");
-  const friendsSnap = await db.ref(`friends/${dangerUserId}`).once("value");
-  const tokens = [];
-  Object.values(friendsSnap.val() || {}).forEach(async id => {
-    const t = (await db.ref(`fcmToken/${id}`).once("value")).val();
-    if (t) tokens.push(t);
-  });
-  if (!tokens.length) return;
-  await admin.messaging().sendMulticast({ notification: { title: "Emergency Detected", body: `${userSnap.val()} triggered ${score}` }, tokens });
+    const db = admin.database();
+    const userSnap   = await db.ref(`username/${dangerUserId}`).once("value");
+    const username   = userSnap.val();
+    functions.logger.info("🔔 Preparing push notifications", { userId: dangerUserId, username, score });
+
+    const friendsSnap = await db.ref(`friends/${dangerUserId}`).once("value");
+    const friends     = friendsSnap.val() || {};
+    const tokens      = [];
+
+    // 친구별로 FCM 토큰 수집
+    for (const friendId of Object.values(friends)) {
+        const tSnap = await db.ref(`fcmToken/${friendId}`).once("value");
+        const token = tSnap.val();
+        if (token) tokens.push(token);
+    }
+
+    if (tokens.length === 0) {
+        functions.logger.warn("⚠️ No FCM tokens found, skipping push", { userId: dangerUserId });
+        return;
+    }
+
+    // 메시지 페이로드 배열 생성
+    const messages = tokens.map(token => ({
+        token,
+        notification: {
+        title: "Emergency Detected",
+        body: `${username} has triggered a danger score of ${score}.`,
+        },
+    }));
+
+    const response = await getMessaging().sendEach(messages);
+    functions.logger.info("✅ Push notifications sent", {
+        successCount: response.successCount,
+        failureCount: response.failureCount,
+    });
 }
 
 app.use((err, req, res, next) => {
@@ -167,4 +250,4 @@ app.use((err, req, res, next) => {
   res.status(500).send({ error: err.message });
 });
 
-exports.handleDangerRequest = onRequest({ region: "asia-northeast3", timeoutSeconds: 60 }, app);
+exports.handleDangerRequest = onRequest({ region: "asia-northeast3", timeoutSeconds: 60, secrets: ["GMAIL_USER", "GMAIL_PASS"] }, app);
