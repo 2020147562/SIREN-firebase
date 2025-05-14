@@ -183,7 +183,7 @@ async function sendEmail(score, wavBuffer, wavName, txtBuffer, txtName, recipien
         from: user,
         to: recipient,
         subject: "SIREN: Emergency Alert",
-        text: `Dear user,
+        text: `Dear trusted contact, a user of SIREN,
 
         An emergency situation has been detected based on the analysis of recent voice and speech input.
 
