@@ -87,6 +87,9 @@ app.post("/", async (req, res) => {
     if (!latitude) return res.status(400).send({ error: "Missing latitude" });
     if (!longitude) return res.status(400).send({ error: "Missing longitude" });
 
+    const userSnap   = await db.ref(`username/${dangerUserId}`).once("value");
+    const username   = userSnap.val();
+
     // Parse gs:// URL
     let bucketName, filePath;
     const gsMatch = storageUrl.match(/^gs:\/\/(.+?)\/(.+)$/);
@@ -115,7 +118,7 @@ app.post("/", async (req, res) => {
 
     // Actions based on score
     if (dangerScore >= 90) {
-      await sendEmail(dangerScore, fs.readFileSync(wav.path), "audio.wav", fs.readFileSync(txt.path), "text.txt", "cp_zero@yonsei.ac.kr");
+      await sendEmail(dangerScore, fs.readFileSync(wav.path), "audio.wav", fs.readFileSync(txt.path), "text.txt", "cp_zero@yonsei.ac.kr", latitude, longitude, username);
     }
     if (dangerScore >= 75) {
         const db = admin.database();
@@ -126,7 +129,7 @@ app.post("/", async (req, res) => {
         const friendIds   = Object.values(friendsObj); // 친구들의 userId 리스트
 
         // 2) 친구들한테 푸시 알림
-        await sendPushNotificationToFriends(dangerScore, userId);
+        await sendPushNotificationToFriends(dangerScore, userId), username;
 
         // 3) 친구들 모두에게 이메일 전송
         for (const friendId of friendIds) {
@@ -157,7 +160,7 @@ app.post("/", async (req, res) => {
   }
 });
 
-async function sendEmail(score, wavBuffer, wavName, txtBuffer, txtName, recipient, latitude, longitude) {
+async function sendEmail(score, wavBuffer, wavName, txtBuffer, txtName, recipient, latitude, longitude, username) {
     // SecretParam에서 실제 문자열을 가져옵니다.
     const user = await gmailUser.value();
     const pass = await gmailPass.value();
@@ -185,7 +188,7 @@ async function sendEmail(score, wavBuffer, wavName, txtBuffer, txtName, recipien
         An emergency situation has been detected based on the analysis of recent voice and speech input.
 
         Danger Score: ${score}
-        Location of the incident: https://www.google.com/maps?q=${latitude},${longitude}
+        Location of ${username}: https://www.google.com/maps?q=${latitude},${longitude}
 
         This score indicates a potentially critical or harmful interaction. For your review and further action, we have attached:
         - The original audio recording (.wav)
@@ -207,10 +210,8 @@ async function sendEmail(score, wavBuffer, wavName, txtBuffer, txtName, recipien
     }
 }
   
-async function sendPushNotificationToFriends(score, dangerUserId) {
+async function sendPushNotificationToFriends(score, dangerUserId, username) {
     const db = admin.database();
-    const userSnap   = await db.ref(`username/${dangerUserId}`).once("value");
-    const username   = userSnap.val();
     functions.logger.info("🔔 Preparing push notifications", { userId: dangerUserId, username, score });
 
     const friendsSnap = await db.ref(`friends/${dangerUserId}`).once("value");
