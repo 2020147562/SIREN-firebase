@@ -87,6 +87,7 @@ app.post("/", async (req, res) => {
     if (!latitude) return res.status(400).send({ error: "Missing latitude" });
     if (!longitude) return res.status(400).send({ error: "Missing longitude" });
 
+    const db = admin.database();
     const userSnap   = await db.ref(`username/${dangerUserId}`).once("value");
     const username   = userSnap.val();
 
@@ -121,20 +122,19 @@ app.post("/", async (req, res) => {
       await sendEmail(dangerScore, fs.readFileSync(wav.path), "audio.wav", fs.readFileSync(txt.path), "text.txt", "cp_zero@yonsei.ac.kr", latitude, longitude, username);
     }
     if (dangerScore >= 75) {
-        const db = admin.database();
-        await sendPushNotificationToFriends(dangerScore, userId);
         // 1) 친구 목록 가져오기
         const friendsSnap = await db.ref(`friends/${userId}`).once("value");
         const friendsObj  = friendsSnap.val() || {};
         const friendIds   = Object.values(friendsObj); // 친구들의 userId 리스트
 
         // 2) 친구들한테 푸시 알림
-        await sendPushNotificationToFriends(dangerScore, userId), username;
+        await sendPushNotificationToFriends(dangerScore, userId, username);
 
         // 3) 친구들 모두에게 이메일 전송
         for (const friendId of friendIds) {
             const emailSnap = await db.ref(`userEmail/${friendId}`).once("value");
             const friendEmail = emailSnap.val();
+
             if (friendEmail) {
             await sendEmail(
                 dangerScore,
@@ -144,7 +144,8 @@ app.post("/", async (req, res) => {
                 "text.txt",
                 friendEmail,
                 latitude,
-                longitude
+                longitude,
+                username
             );
             functions.logger.info("📧 Email sent to friend", { friendId, friendEmail });
             } else {
